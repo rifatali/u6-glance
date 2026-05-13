@@ -1,17 +1,12 @@
 """
 Glance LED -> Berlin U6 Schwartzkopffstr. departures (PNG)
 
-Two ways to use this:
-
-  1) As a Flask server (live, polled by Glance directly):
-         python departures.py            # http://0.0.0.0:8080/
-
-  2) As a one-shot PNG generator (for GitHub Actions + Pages):
-         python build.py                 # writes docs/u6.png
-
-The image is 384x32 and shows absolute departure times (HH:MM) for the
-next U6 trains in both directions, so a 5-minute CI refresh interval
-does not lead to misleading "minutes until" values.
+Shows the next U6 trains in both directions as minutes-until-departure
+on a 384x32 LED panel. Resilient against BVG returning departures out
+of chronological order (real-time tracked ones come AFTER planned-only
+ones in the response), and against terminus name changes (e.g. during
+construction the north-bound terminus is "Kurt-Schumacher-Platz"
+instead of "Alt-Tegel").
 """
 
 import io
@@ -29,24 +24,28 @@ BVG_BASE = "https://v6.bvg.transport.rest"
 STATION_QUERY = "Schwartzkopffstr"
 LINE_FILTER = "U6"
 
-DIR_NORTH = "Alt-Tegel"
-DIR_SOUTH = "Alt-Mariendorf"
-DIR_SHORT = {DIR_NORTH: "Tegel", DIR_SOUTH: "Mariendorf"}
+# Each direction is a tuple of acceptable terminus substrings — covers
+# both the official northern terminus (Alt-Tegel) and the temporary
+# construction-time turnaround (Kurt-Schumacher-Platz).
+DIR_NORTH_MATCH = ("Alt-Tegel", "Kurt-Schumacher-Platz", "Kurt-Schumacher")
+DIR_SOUTH_MATCH = ("Alt-Mariendorf",)
+DIR_NORTH_LABEL = "Tegel"
+DIR_SOUTH_LABEL = "Mariendorf"
 
 CACHE_TTL = 20
-LOOKAHEAD_MIN = 60
+LOOKAHEAD_MIN = 90
 
 PANEL_W = 384
 PANEL_H = 32
-
-BERLIN_TZ = timezone(timedelta(hours=2))   # Berlin summer time (DST aware below)
 
 BG          = (0, 0, 0)
 U6_BG       = (139, 71, 137)
 U6_FG       = (255, 255, 255)
 DIR_COLOR   = (255, 165, 0)
-TIME_NEXT   = (255, 255, 255)   # next departure: white
-TIME_LATER  = (130, 220, 130)   # later ones: pale green
+MIN_SOON    = (255, 51, 51)    # <= 2 min: red
+MIN_NEAR    = (255, 255, 0)    # <= 5 min: yellow
+MIN_FAR     = (0, 255, 85)     # otherwise: green
+MIN_LABEL   = (170, 170, 170)
 DIVIDER     = (40, 40, 40)
 EMPTY_TEXT  = (160, 160, 160)
 
@@ -74,7 +73,8 @@ def _load_font(candidates, size):
 
 FONT_LABEL = _load_font(FONT_CANDIDATES_SANS, 11)
 FONT_BADGE = _load_font(FONT_CANDIDATES_SANS, 12)
-FONT_TIME  = _load_font(FONT_CANDIDATES_MONO, 13)
+FONT_MIN   = _load_font(FONT_CANDIDATES_MONO, 16)   # big minutes
+FONT_UNIT  = _load_font(FONT_CANDIDATES_SANS, 9)    # "min" label
 
 # --- BVG client -------------------------------------------------------------
 
@@ -113,7 +113,7 @@ def fetch_departures():
             "duration": LOOKAHEAD_MIN, "subway": "true",
             "suburban": "false", "tram": "false", "bus": "false",
             "ferry": "false", "express": "false", "regional": "false",
-            "results": 30, "language": "de",
+            "results": 60, "language": "de",
         },
         timeout=10,
     )
@@ -126,29 +126,49 @@ def fetch_departures():
     return deps
 
 
-def next_times_for_direction(deps, terminus, n=3):
-    """Return list of HH:MM strings for the next n departures heading to `terminus`."""
-    out = []
+def _parse_ts(ts):
+    if not ts:
+        return None
+    try:
+        when = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return when
+
+
+def next_minutes_for_direction(deps, terminus_match, n=3):
+    """Return the next n minutes-until-departure for matching trains."""
     now_utc = datetime.now(timezone.utc)
+    candidates = []
     for d in deps:
         if (d.get("line") or {}).get("name") != LINE_FILTER:
             continue
-        if terminus not in (d.get("direction") or ""):
+        direction = d.get("direction") or ""
+        if not any(t in direction for t in terminus_match):
             continue
-        ts = d.get("when") or d.get("plannedWhen")
-        if not ts:
+        when = _parse_ts(d.get("when") or d.get("plannedWhen"))
+        if when is None:
             continue
-        try:
-            when = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-        except ValueError:
-            continue
-        if when < now_utc - timedelta(minutes=1):
-            continue   # skip departures already in the past
-        # BVG returns timestamps with proper tz offset for Berlin
-        out.append(when.strftime("%H:%M"))
+        if when < now_utc - timedelta(seconds=30):
+            continue   # already in the past
+        candidates.append(when)
+    # Explicit sort — BVG mixes planned-only and real-time entries
+    candidates.sort()
+    out = []
+    for when in candidates:
+        mins = int((when - now_utc).total_seconds() / 60)
+        out.append(max(0, mins))
         if len(out) >= n:
             break
     return out
+
+
+def color_for_minutes(m):
+    if m <= 2: return MIN_SOON
+    if m <= 5: return MIN_NEAR
+    return MIN_FAR
 
 # --- Rendering --------------------------------------------------------------
 
@@ -161,38 +181,39 @@ def _draw_badge(draw, x, y, w=22, h=14):
     draw.text((tx, ty), "U6", fill=U6_FG, font=FONT_BADGE)
 
 
-def _draw_half(draw, x0, width, terminus, times):
-    """Draw one direction tile into [x0, x0+width)."""
+def _draw_half(draw, x0, width, label, minutes):
     badge_w, badge_h = 22, 14
     _draw_badge(draw, x0 + 2, 1, w=badge_w, h=badge_h)
 
-    short = DIR_SHORT.get(terminus, terminus)
-    draw.text((x0 + 2 + badge_w + 4, 1), f"> {short}",
+    draw.text((x0 + 2 + badge_w + 4, 1), f"> {label}",
               fill=DIR_COLOR, font=FONT_LABEL)
 
-    if not times:
+    if not minutes:
         draw.text((x0 + 2, 17), "keine Daten",
                   fill=EMPTY_TEXT, font=FONT_LABEL)
         return
 
-    # Distribute up to 3 HH:MM times evenly across the half
-    inner_x = x0 + 2
-    inner_w = width - 4
-    cells = len(times)
+    # Lay out up to 3 minute values across the half
+    inner_x = x0 + 4
+    inner_w = width - 26          # leave room for "min" on the right
+    cells = len(minutes)
     cell_w = inner_w // cells
-    for i, t in enumerate(times):
-        bbox = draw.textbbox((0, 0), t, font=FONT_TIME)
+    for i, m in enumerate(minutes):
+        text = str(m)
+        bbox = draw.textbbox((0, 0), text, font=FONT_MIN)
         tw = bbox[2] - bbox[0]
         cx = inner_x + cell_w // 2 + i * cell_w - tw // 2 - bbox[0]
-        color = TIME_NEXT if i == 0 else TIME_LATER
-        draw.text((cx, 17), t, fill=color, font=FONT_TIME)
+        draw.text((cx, 15), text, fill=color_for_minutes(m), font=FONT_MIN)
+
+    draw.text((x0 + width - 22, 21), "min",
+              fill=MIN_LABEL, font=FONT_UNIT)
 
 
 def render_png():
     try:
         deps = fetch_departures()
-        north = next_times_for_direction(deps, DIR_NORTH, n=3)
-        south = next_times_for_direction(deps, DIR_SOUTH, n=3)
+        north = next_minutes_for_direction(deps, DIR_NORTH_MATCH, n=3)
+        south = next_minutes_for_direction(deps, DIR_SOUTH_MATCH, n=3)
     except Exception as e:
         print(f"[warn] BVG fetch failed: {e}")
         north = south = []
@@ -202,15 +223,15 @@ def render_png():
     draw.fontmode = "1"
 
     half = PANEL_W // 2
-    _draw_half(draw, 0, half, DIR_NORTH, north)
-    _draw_half(draw, half, half, DIR_SOUTH, south)
+    _draw_half(draw, 0, half, DIR_NORTH_LABEL, north)
+    _draw_half(draw, half, half, DIR_SOUTH_LABEL, south)
     draw.line([(half, 2), (half, PANEL_H - 3)], fill=DIVIDER)
 
     buf = io.BytesIO()
     img.save(buf, format="PNG", optimize=True)
     return buf.getvalue()
 
-# --- Flask app (optional, only used by `python departures.py`) --------------
+# --- Flask app (optional) ---------------------------------------------------
 
 try:
     from flask import Flask, send_file, jsonify
@@ -235,5 +256,5 @@ except ImportError:
 
 if __name__ == "__main__":
     if app is None:
-        raise SystemExit("flask not installed — `pip install flask` to run as server")
+        raise SystemExit("flask not installed")
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
