@@ -1,0 +1,89 @@
+name: refresh-u6-png
+
+# Run every 5 minutes (the minimum GitHub-Actions cron interval) and,
+# inside each run, generate the PNG five times spaced 60 seconds apart
+# - so the published image ends up being updated roughly every minute.
+#
+# Public repo + ubuntu-latest → GitHub Actions minutes are free and
+# unlimited, so this is fine to run forever.
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Don't queue overlapping runs; let the running one finish first.
+concurrency:
+  group: refresh-png
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Render + publish loop (5 x 60s)
+        env:
+          TZ: Europe/Berlin
+          GIT_USER: github-actions[bot]
+          GIT_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+        run: |
+          set -euo pipefail
+          git config user.name  "$GIT_USER"
+          git config user.email "$GIT_EMAIL"
+
+          # Work inside a temp folder that we force-push to gh-pages.
+          PUB=$(mktemp -d)
+          # Empty index page so users hitting the repo URL see something.
+          cat > "$PUB/index.html" <<'HTML'
+          <!doctype html><meta charset=utf-8>
+          <title>Glance LED U6 feed</title>
+          <style>body{background:#111;color:#eee;font-family:monospace;text-align:center;padding:2em}img{image-rendering:pixelated;border:1px solid #333}</style>
+          <h1>Berlin U6 Schwartzkopffstr.</h1>
+          <p>Live PNG (refreshed every ~1 minute):</p>
+          <p><img src="u6.png" width="768" height="64" alt="u6"></p>
+          <p><small>powered by v6.bvg.transport.rest</small></p>
+          HTML
+          # .nojekyll so GitHub Pages serves files starting with _ if any.
+          touch "$PUB/.nojekyll"
+
+          # Initialise gh-pages branch (fresh, no history retained).
+          (
+            cd "$PUB"
+            git init -q -b gh-pages
+            git remote add origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+          )
+
+          for i in 1 2 3 4 5; do
+            echo "=== iteration $i / 5 ($(date -u +%H:%M:%SZ)) ==="
+            python build.py "$PUB/u6.png"
+
+            (
+              cd "$PUB"
+              git add -A
+              git -c commit.gpgsign=false commit -q --allow-empty \
+                -m "refresh u6.png ($(date -u +%H:%MZ))"
+              # Force-push so history stays at exactly one commit.
+              git reset -q --soft $(git commit-tree HEAD^{tree} -m "u6 live") 2>/dev/null || true
+              git push -q -f origin gh-pages
+            )
+
+            # No sleep after the last iteration; cron will trigger again
+            if [ "$i" -lt 5 ]; then sleep 60; fi
+          done
