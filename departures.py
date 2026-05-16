@@ -1,12 +1,11 @@
 """
 Glance LED -> Berlin U6 Schwartzkopffstr. departures (PNG)
 
-Shows the next U6 trains in both directions as minutes-until-departure
-on a 384x32 LED panel. Resilient against BVG returning departures out
-of chronological order (real-time tracked ones come AFTER planned-only
-ones in the response), and against terminus name changes (e.g. during
-construction the north-bound terminus is "Kurt-Schumacher-Platz"
-instead of "Alt-Tegel").
+BVG-Bahnhofs-Stil:
+  - Schwarz mit amber-orangenem Text wie an einer echten U-Bahn-Anzeige
+  - Header "Linie  Ziel  Abfahrt"
+  - Eine Zeile pro Abfahrt, sortiert nach Zeit
+  - Beide Richtungen
 """
 
 import io
@@ -24,13 +23,9 @@ BVG_BASE = "https://v6.bvg.transport.rest"
 STATION_QUERY = "Schwartzkopffstr"
 LINE_FILTER = "U6"
 
-# Each direction is a tuple of acceptable terminus substrings — covers
-# both the official northern terminus (Alt-Tegel) and the temporary
-# construction-time turnaround (Kurt-Schumacher-Platz).
+# Direction matching — covers Alt-Tegel + Kurt-Schumacher-Platz (Baustelle)
 DIR_NORTH_MATCH = ("Alt-Tegel", "Kurt-Schumacher-Platz", "Kurt-Schumacher")
 DIR_SOUTH_MATCH = ("Alt-Mariendorf",)
-DIR_NORTH_LABEL = "Tegel"
-DIR_SOUTH_LABEL = "Mariendorf"
 
 CACHE_TTL = 20
 LOOKAHEAD_MIN = 90
@@ -39,18 +34,19 @@ PANEL_W = 384
 PANEL_H = 32
 
 BG          = (0, 0, 0)
-U6_BG       = (139, 71, 137)
-U6_FG       = (255, 255, 255)
-DIR_COLOR   = (255, 165, 0)
-MIN_SOON    = (255, 51, 51)    # <= 2 min: red
-MIN_NEAR    = (255, 255, 0)    # <= 5 min: yellow
-MIN_FAR     = (0, 255, 85)     # otherwise: green
-MIN_LABEL   = (170, 170, 170)
-DIVIDER     = (40, 40, 40)
-EMPTY_TEXT  = (160, 160, 160)
+AMBER       = (255, 160, 0)      # BVG amber
+AMBER_DIM   = (180, 110, 0)      # for the header
+EMPTY_TEXT  = (130, 90, 0)
 
-FONT_CANDIDATES_SANS = [
+# Layout columns (x positions)
+COL_LINIE_X   = 2
+COL_ZIEL_X    = 36
+COL_ABFAHRT_R = 380   # right edge for right-aligned minutes
+
+# Font candidates
+FONT_CANDIDATES_SANS_NARROW = [
     "/usr/share/fonts/opentype/urw-base35/NimbusSansNarrow-Bold.otf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSansCondensed-Bold.ttf",
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
     "C:\\Windows\\Fonts\\arialbd.ttf",
 ]
@@ -71,10 +67,9 @@ def _load_font(candidates, size):
     return ImageFont.load_default()
 
 
-FONT_LABEL = _load_font(FONT_CANDIDATES_SANS, 11)
-FONT_BADGE = _load_font(FONT_CANDIDATES_SANS, 12)
-FONT_MIN   = _load_font(FONT_CANDIDATES_MONO, 16)   # big minutes
-FONT_UNIT  = _load_font(FONT_CANDIDATES_SANS, 9)    # "min" label
+FONT_HEADER = _load_font(FONT_CANDIDATES_SANS_NARROW, 9)
+FONT_ROW    = _load_font(FONT_CANDIDATES_SANS_NARROW, 11)
+FONT_MIN    = _load_font(FONT_CANDIDATES_MONO, 11)
 
 # --- BVG client -------------------------------------------------------------
 
@@ -138,94 +133,120 @@ def _parse_ts(ts):
     return when
 
 
-def next_minutes_for_direction(deps, terminus_match, n=3):
-    """Return the next n minutes-until-departure for matching trains."""
+def next_for_direction(deps, terminus_match, n=1):
+    """Return next n departures matching the direction as list of
+       (when_dt, direction_str, line_name)."""
     now_utc = datetime.now(timezone.utc)
-    candidates = []
+    cands = []
     for d in deps:
-        if (d.get("line") or {}).get("name") != LINE_FILTER:
+        line = (d.get("line") or {}).get("name")
+        if line != LINE_FILTER:
             continue
         direction = d.get("direction") or ""
         if not any(t in direction for t in terminus_match):
             continue
         when = _parse_ts(d.get("when") or d.get("plannedWhen"))
-        if when is None:
+        if when is None or when < now_utc - timedelta(seconds=30):
             continue
-        if when < now_utc - timedelta(seconds=30):
-            continue   # already in the past
-        candidates.append(when)
-    # Explicit sort — BVG mixes planned-only and real-time entries
-    candidates.sort()
-    out = []
-    for when in candidates:
-        mins = int((when - now_utc).total_seconds() / 60)
-        out.append(max(0, mins))
-        if len(out) >= n:
-            break
-    return out
+        cands.append((when, direction, line))
+    cands.sort(key=lambda c: c[0])
+    return cands[:n]
 
 
-def color_for_minutes(m):
-    if m <= 2: return MIN_SOON
-    if m <= 5: return MIN_NEAR
-    return MIN_FAR
+def build_rows():
+    """Return list of (line, ziel, minutes_int), sorted by minutes asc."""
+    deps = fetch_departures()
+    now_utc = datetime.now(timezone.utc)
+    rows = []
+    for terminus_match in (DIR_NORTH_MATCH, DIR_SOUTH_MATCH):
+        for when, direction, line in next_for_direction(deps, terminus_match, n=1):
+            mins = max(0, int((when - now_utc).total_seconds() / 60))
+            # Clean up the destination name: strip leading "U " etc
+            ziel = direction.strip()
+            for prefix in ("S+U ", "S ", "U "):
+                if ziel.startswith(prefix):
+                    ziel = ziel[len(prefix):]
+                    break
+            rows.append((line, ziel, mins))
+    rows.sort(key=lambda r: r[2])
+    return rows
 
 # --- Rendering --------------------------------------------------------------
 
-def _draw_badge(draw, x, y, w=22, h=14):
-    draw.rectangle([x, y, x + w - 1, y + h - 1], fill=U6_BG)
-    bbox = draw.textbbox((0, 0), "U6", font=FONT_BADGE)
-    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-    tx = x + (w - tw) // 2 - bbox[0]
-    ty = y + (h - th) // 2 - bbox[1] - 1
-    draw.text((tx, ty), "U6", fill=U6_FG, font=FONT_BADGE)
+def _text_width(draw, text, font):
+    bbox = draw.textbbox((0, 0), text, font=font)
+    return bbox[2] - bbox[0], -bbox[0]
 
 
-def _draw_half(draw, x0, width, label, minutes):
-    badge_w, badge_h = 22, 14
-    _draw_badge(draw, x0 + 2, 1, w=badge_w, h=badge_h)
+def _draw_right_aligned(draw, x_right, y, text, font, color):
+    w, ox = _text_width(draw, text, font)
+    draw.text((x_right - w + ox, y), text, fill=color, font=font)
 
-    draw.text((x0 + 2 + badge_w + 4, 1), f"> {label}",
-              fill=DIR_COLOR, font=FONT_LABEL)
 
-    if not minutes:
-        draw.text((x0 + 2, 17), "keine Daten",
-                  fill=EMPTY_TEXT, font=FONT_LABEL)
+def _draw_truncated(draw, x, y, max_x, text, font, color):
+    """Draw text starting at x; truncate with '...' if it would pass max_x."""
+    w, ox = _text_width(draw, text, font)
+    if x + w <= max_x:
+        draw.text((x - ox, y), text, fill=color, font=font)
         return
-
-    # Lay out up to 3 minute values across the half
-    inner_x = x0 + 4
-    inner_w = width - 26          # leave room for "min" on the right
-    cells = len(minutes)
-    cell_w = inner_w // cells
-    for i, m in enumerate(minutes):
-        text = str(m)
-        bbox = draw.textbbox((0, 0), text, font=FONT_MIN)
-        tw = bbox[2] - bbox[0]
-        cx = inner_x + cell_w // 2 + i * cell_w - tw // 2 - bbox[0]
-        draw.text((cx, 15), text, fill=color_for_minutes(m), font=FONT_MIN)
-
-    draw.text((x0 + width - 22, 21), "min",
-              fill=MIN_LABEL, font=FONT_UNIT)
+    # Truncate character by character
+    s = text
+    while len(s) > 1:
+        s = s[:-1]
+        candidate = s + "."
+        cw, cox = _text_width(draw, candidate, font)
+        if x + cw <= max_x:
+            draw.text((x - cox, y), candidate, fill=color, font=font)
+            return
+    # fallback
+    draw.text((x, y), "...", fill=color, font=font)
 
 
 def render_png():
     try:
-        deps = fetch_departures()
-        north = next_minutes_for_direction(deps, DIR_NORTH_MATCH, n=3)
-        south = next_minutes_for_direction(deps, DIR_SOUTH_MATCH, n=3)
+        rows = build_rows()
     except Exception as e:
         print(f"[warn] BVG fetch failed: {e}")
-        north = south = []
+        rows = []
 
     img = Image.new("RGB", (PANEL_W, PANEL_H), BG)
     draw = ImageDraw.Draw(img)
-    draw.fontmode = "1"
+    draw.fontmode = "1"   # crisp pixel rendering (no anti-aliasing)
 
-    half = PANEL_W // 2
-    _draw_half(draw, 0, half, DIR_NORTH_LABEL, north)
-    _draw_half(draw, half, half, DIR_SOUTH_LABEL, south)
-    draw.line([(half, 2), (half, PANEL_H - 3)], fill=DIVIDER)
+    # Header row: "Linie   Ziel ...   Abfahrt"
+    HEADER_Y = 0
+    draw.text((COL_LINIE_X, HEADER_Y), "Linie",
+              fill=AMBER_DIM, font=FONT_HEADER)
+    draw.text((COL_ZIEL_X, HEADER_Y), "Ziel",
+              fill=AMBER_DIM, font=FONT_HEADER)
+    _draw_right_aligned(draw, COL_ABFAHRT_R, HEADER_Y,
+                        "Abfahrt", FONT_HEADER, AMBER_DIM)
+
+    # Underline between header and data
+    draw.line([(2, 10), (PANEL_W - 3, 10)], fill=AMBER_DIM)
+
+    # Data rows
+    row_ys = [12, 22]
+    for i, y in enumerate(row_ys):
+        if i >= len(rows):
+            if i == 0 and not rows:
+                draw.text((COL_ZIEL_X, y), "keine Daten",
+                          fill=EMPTY_TEXT, font=FONT_ROW)
+            break
+        line, ziel, mins = rows[i]
+
+        # Line column (left)
+        draw.text((COL_LINIE_X, y), line, fill=AMBER, font=FONT_ROW)
+
+        # Ziel column (truncate if too long)
+        ziel_right_limit = COL_ABFAHRT_R - 40   # leave room for minutes
+        _draw_truncated(draw, COL_ZIEL_X, y, ziel_right_limit,
+                        ziel, FONT_ROW, AMBER)
+
+        # Abfahrt column (right-aligned)
+        mins_text = f"{mins}'" if mins > 0 else "jetzt"
+        _draw_right_aligned(draw, COL_ABFAHRT_R, y,
+                            mins_text, FONT_MIN, AMBER)
 
     buf = io.BytesIO()
     img.save(buf, format="PNG", optimize=True)
