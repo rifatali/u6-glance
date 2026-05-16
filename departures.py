@@ -1,10 +1,10 @@
 """
 Glance LED -> Berlin U6 Schwartzkopffstr. departures (PNG)
 
-BVG-Bahnhofs-Stil ohne Header:
-  - 384x32, schwarz mit amber-orangenem Text
-  - Zwei Zeilen, je eine Abfahrt, groß und gut lesbar
-  - Sortiert nach Zeit, beide Richtungen
+384x32 schwarz mit amber-orangenem Text, ZWEI ZEILEN je Richtung.
+Der Inhalt wechselt im 15-Sekunden-Rhythmus zwischen den beiden
+Richtungen (Tegel/K-S-Platz <-> Mariendorf), damit Glance bei seiner
+naechsten Abfrage abwechselnd die eine oder andere Richtung sieht.
 """
 
 import io
@@ -25,7 +25,10 @@ LINE_FILTER = "U6"
 DIR_NORTH_MATCH = ("Alt-Tegel", "Kurt-Schumacher-Platz", "Kurt-Schumacher")
 DIR_SOUTH_MATCH = ("Alt-Mariendorf",)
 
-CACHE_TTL = 20
+# Bucket size: every BUCKET_SECONDS the displayed direction flips
+BUCKET_SECONDS = 15
+
+CACHE_TTL = 10        # short cache - we want fresh content per render
 LOOKAHEAD_MIN = 90
 
 PANEL_W = 384
@@ -35,13 +38,11 @@ BG          = (0, 0, 0)
 AMBER       = (255, 160, 0)
 EMPTY_TEXT  = (130, 90, 0)
 
-# Layout: two 16-pixel rows, full panel height each
 COL_LINIE_X   = 2
 COL_ZIEL_X    = 44
 COL_ABFAHRT_R = 380
-ROW_YS        = (1, 17)        # baselines for the two big rows
+ROW_YS        = (1, 17)
 
-# Fonts
 FONT_CANDIDATES_SANS_NARROW = [
     "/usr/share/fonts/opentype/urw-base35/NimbusSansNarrow-Bold.otf",
     "/usr/share/fonts/truetype/dejavu/DejaVuSansCondensed-Bold.ttf",
@@ -130,7 +131,7 @@ def _parse_ts(ts):
     return when
 
 
-def next_for_direction(deps, terminus_match, n=1):
+def next_for_direction(deps, terminus_match, n=2):
     now_utc = datetime.now(timezone.utc)
     cands = []
     for d in deps:
@@ -148,20 +149,18 @@ def next_for_direction(deps, terminus_match, n=1):
     return cands[:n]
 
 
-def build_rows():
-    deps = fetch_departures()
+def build_frame_rows(deps, terminus_match):
+    """Return list of (line, ziel, mins) for the next 2 departures of one direction."""
     now_utc = datetime.now(timezone.utc)
     rows = []
-    for terminus_match in (DIR_NORTH_MATCH, DIR_SOUTH_MATCH):
-        for when, direction, line in next_for_direction(deps, terminus_match, n=1):
-            mins = max(0, int((when - now_utc).total_seconds() / 60))
-            ziel = direction.strip()
-            for prefix in ("S+U ", "S ", "U "):
-                if ziel.startswith(prefix):
-                    ziel = ziel[len(prefix):]
-                    break
-            rows.append((line, ziel, mins))
-    rows.sort(key=lambda r: r[2])
+    for when, direction, line in next_for_direction(deps, terminus_match, n=2):
+        mins = max(0, int((when - now_utc).total_seconds() / 60))
+        ziel = direction.strip()
+        for prefix in ("S+U ", "S ", "U "):
+            if ziel.startswith(prefix):
+                ziel = ziel[len(prefix):]
+                break
+        rows.append((line, ziel, mins))
     return rows
 
 # --- Rendering --------------------------------------------------------------
@@ -192,16 +191,11 @@ def _draw_truncated(draw, x, y, max_x, text, font, color):
     draw.text((x, y), "...", fill=color, font=font)
 
 
-def render_png():
-    try:
-        rows = build_rows()
-    except Exception as e:
-        print(f"[warn] BVG fetch failed: {e}")
-        rows = []
-
+def render_frame(rows):
+    """Render a single 384x32 frame for the given rows."""
     img = Image.new("RGB", (PANEL_W, PANEL_H), BG)
     draw = ImageDraw.Draw(img)
-    draw.fontmode = "1"   # crisp pixel rendering
+    draw.fontmode = "1"
 
     for i, y in enumerate(ROW_YS):
         if i >= len(rows):
@@ -210,20 +204,47 @@ def render_png():
                           fill=EMPTY_TEXT, font=FONT_ROW)
             break
         line, ziel, mins = rows[i]
-
-        # Linie column
         draw.text((COL_LINIE_X, y), line, fill=AMBER, font=FONT_ROW)
-
-        # Ziel column (truncate)
-        ziel_right_limit = COL_ABFAHRT_R - 50    # leave room for the minutes
+        ziel_right_limit = COL_ABFAHRT_R - 50
         _draw_truncated(draw, COL_ZIEL_X, y, ziel_right_limit,
                         ziel, FONT_ROW, AMBER)
-
-        # Abfahrt column (right-aligned)
         mins_text = f"{mins}'" if mins > 0 else "jetzt"
         _draw_right_aligned(draw, COL_ABFAHRT_R, y,
                             mins_text, FONT_MIN, AMBER)
+    return img
 
+
+def render_png():
+    """Return a single 384x32 PNG. Which direction is shown depends on the
+       current 15-second bucket - so the same URL alternates between
+       directions over time."""
+    try:
+        deps = fetch_departures()
+    except Exception as e:
+        print(f"[warn] BVG fetch failed: {e}")
+        deps = []
+
+    bucket = (int(time.time()) // BUCKET_SECONDS) % 2
+    terminus = DIR_NORTH_MATCH if bucket == 0 else DIR_SOUTH_MATCH
+    rows = build_frame_rows(deps, terminus)
+    img = render_frame(rows)
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
+
+
+def render_png_for_direction(north=True):
+    """Render a static PNG for one specific direction (used for the
+       direction-specific URLs tegel.png / mariendorf.png)."""
+    try:
+        deps = fetch_departures()
+    except Exception as e:
+        print(f"[warn] BVG fetch failed: {e}")
+        deps = []
+    terminus = DIR_NORTH_MATCH if north else DIR_SOUTH_MATCH
+    rows = build_frame_rows(deps, terminus)
+    img = render_frame(rows)
     buf = io.BytesIO()
     img.save(buf, format="PNG", optimize=True)
     return buf.getvalue()
@@ -236,7 +257,17 @@ try:
 
     @app.get("/")
     def index():
-        return send_file(io.BytesIO(render_png()), mimetype="image/png", max_age=10)
+        return send_file(io.BytesIO(render_png()), mimetype="image/png", max_age=5)
+
+    @app.get("/tegel.png")
+    def tegel():
+        return send_file(io.BytesIO(render_png_for_direction(north=True)),
+                         mimetype="image/png", max_age=5)
+
+    @app.get("/mariendorf.png")
+    def mariendorf():
+        return send_file(io.BytesIO(render_png_for_direction(north=False)),
+                         mimetype="image/png", max_age=5)
 
     @app.get("/raw")
     def raw():
