@@ -141,7 +141,7 @@ def draw_text_scrolling(img, region, text, font, color, t=None, gap_px=12, speed
 
 
 def crop_to_region(img, region):
-    """Mask the image so only the given region ist visible (everything outside
+    """Mask the image so only the given region is visible (everything outside
        becomes BG)."""
     rx, ry, rw, rh = region
     canvas = Image.new("RGB", (PANEL_W, PANEL_H), BG)
@@ -307,7 +307,7 @@ def render_u6_south(_t=None):
 
 # ============================================================================
 # App: Clock
-# ===========================================================================
+# ============================================================================
 
 BERLIN_TZ_OFFSET_S = 2 * 3600   # CEST (summer); for winter use 3600
 WEEKDAYS_DE = ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"]
@@ -360,7 +360,7 @@ def fetch_weather():
 
 
 # --- 16x16 pixel-art weather icons -----------------------------------------
-# Each icon ist a list of 16 strings, 16 chars wide. Character -> color:
+# Each icon is a list of 16 strings, 16 chars wide. Character -> color:
 #   '.' transparent, 's' sun, 'c' cloud, 'r' rain, 'n' snow,
 #   't' thunder, 'm' moon
 
@@ -453,7 +453,7 @@ ICON_RAIN = [
     "..cccccccccc....",
     "..cccccccccc....",
     "...cccccccc.....",
-    "..rrrrrrrrrr....",
+    "..rrrrrrrrr.....",
     ".r..r..r..r.....",
     "r..r..r..r......",
     "..r..r..r.r.....",
@@ -524,8 +524,8 @@ ICON_FOG = [
 
 
 def draw_icon(img, x, y, icon, palette=PIXEL_PALETTE):
-    for j, rwo in enumerate(icon):
-        for i, ch in enumerate(rwo):
+    for j, row in enumerate(icon):
+        for i, ch in enumerate(row):
             if ch in palette:
                 img.putpixel((x + i, y + j), palette[ch])
 
@@ -571,16 +571,16 @@ def render_weather(_t=None):
     draw_icon(img, 0, 8, weather_icon_for(code, is_day))
 
     # Right half: big temperature + min/max
-    temp_str = f"{temp}\xb0"
+    temp_str = str(temp) + "\xb0"
     draw_centered(draw, 16 + (PANEL_W - 16) // 2, -1, temp_str, FONT_BIG, AMBER)
-    minmax = f"{min_t}\xb0/{max_t}\xb0"
+    minmax = str(min_t) + "\xb0/" + str(max_t) + "\xb0"
     draw_centered(draw, 16 + (PANEL_W - 16) // 2, 19, minmax, FONT_SMALL, AMBER_DIM)
     return img
 
 
 # ============================================================================
 # Router
-# ============================================================================
+# ===========================================================================
 
 APPS = [
     ("u6_north", render_u6_north),
