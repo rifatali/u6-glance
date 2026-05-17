@@ -573,7 +573,7 @@ def render_weather(_t=None):
     # Right half: big temperature + min/max
     temp_str = f"{temp}\xb0"
     draw_centered(draw, 16 + (PANEL_W - 16) // 2, -1, temp_str, FONT_BIG, AMBER)
-    minmax = f"{[min_t}\xb0/{max_t}\xb0"
+    minmax = f"{min_t}\xb0/{max_t}\xb0"
     draw_centered(draw, 16 + (PANEL_W - 16) // 2, 19, minmax, FONT_SMALL, AMBER_DIM)
     return img
 
