@@ -1,0 +1,13 @@
+# Render.com Blueprint - automatically detected when you connect this repo.
+# https://render.com/docs/blueprint-spec
+services:
+  - type: web
+    name: u6-glance
+    runtime: python
+    plan: free
+    region: frankfurt
+    pythonVersion: "3.12"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python departures.py
+    healthCheckPath: /healthz
+    autoDeploy: true
