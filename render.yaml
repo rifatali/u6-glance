@@ -6,7 +6,6 @@ services:
     runtime: python
     plan: free
     region: frankfurt
-    pythonVersion: "3.12"
     buildCommand: pip install -r requirements.txt
     startCommand: python departures.py
     healthCheckPath: /healthz
