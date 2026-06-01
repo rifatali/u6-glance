@@ -1,0 +1,30 @@
+# fly.toml for u6-glance
+# Always-on tiny VM in Frankfurt. No cold starts, so Glance polls work
+# instantly. Free-tier eligible (1 shared-cpu-1x, 256 MB).
+
+app = "u6-glance"
+primary_region = "fra"
+
+[build]
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  # Keep at least one machine alive at all times -- that is what kills the
+  # 15 s cold start that Render had.
+  auto_stop_machines = "off"
+  auto_start_machines = false
+  min_machines_running = 1
+  processes = ["app"]
+
+[[http_service.checks]]
+  interval = "30s"
+  timeout = "5s"
+  grace_period = "10s"
+  method = "GET"
+  path = "/healthz"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
+  cpus = 1
